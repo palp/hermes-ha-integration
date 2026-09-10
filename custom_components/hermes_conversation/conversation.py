@@ -28,7 +28,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent, template
 
-from .api import HermesApiClient, HermesApiError, HermesStreamSetupError
+from .api import HermesApiClient, HermesApiError, HermesStreamResult, HermesStreamSetupError
 from .compat import entry_value, resolve_continued_conversation_mode
 from .const import (
     CONF_ALWAYS_SPEAK_FALLBACK,
@@ -368,8 +368,23 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         )
         follow_up_mode = self._continued_conversation_mode()
         session_reuse = self._session_reuse_enabled()
-        session_key = self._build_session_key(user_input, conv_id) if session_reuse else None
+        authenticated = bool(entry_value(
+            self.entry, CONF_API_KEY, "", prefer_options=False
+        ))
+        # Reuse off disables cross-conversation device/satellite reuse, not
+        # continuation of the established HA chat log's backend trace.
+        session_key = (
+            self._build_session_key(user_input, conv_id)
+            if session_reuse else f"conversation:{conv_id}" if authenticated else None
+        )
         session_id = self._get_active_session_id(session_key) if session_key else None
+        if session_id is None and authenticated:
+            # Never fall back to Hermes's deterministic headerless fingerprint.
+            session_id = str(uuid.uuid4())
+        if session_key and not session_reuse:
+            # Reserve before the first await: overlapping turns for this HA
+            # conversation must not allocate different backend sessions.
+            self._remember_session(session_key, session_id)
 
         # Resolve username from HA auth
         user_name = await self._get_user_name(user_input)
@@ -407,14 +422,18 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             messages.extend(history)
             messages.append({"role": "user", "content": user_input.text})
 
+        response = HermesStreamResult(session_id=session_id)
         try:
             if chat_log is None:
-                response_text = await self._get_response(messages, session_id=session_id)
+                response_text = await self._get_response(
+                    messages, session_id=session_id, response=response
+                )
             else:
                 response_text = await self._stream_chat_log_response(
                     chat_log,
                     messages,
                     session_id=session_id,
+                    response=response,
                 )
             spoken_text = _sanitize_text_for_speech(response_text)
         except HermesApiError as err:
@@ -430,8 +449,13 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 continue_conversation=False,
             )
 
-        if session_key:
-            self._remember_session(session_key, self.client.last_session_id)
+        if session_key and (
+            session_reuse
+            or self.session_map.get(session_key, {}).get("session_id") == session_id
+        ):
+            # Reuse-off responses may rotate only the session they addressed;
+            # a late response must not undo expiry, reset, or another rotation.
+            self._remember_session(session_key, response.session_id)
 
         if not session_reuse:
             history = self._history.setdefault(conv_id, [])
@@ -466,6 +490,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         chat_log: ChatLog,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        response: HermesStreamResult | None = None,
     ) -> str:
         """Stream safe assistant deltas into Home Assistant's chat log."""
         chunks: list[str] = []
@@ -474,7 +499,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             started = False
             try:
                 async for chunk in self._iter_voice_safe_response(
-                    messages, session_id=session_id
+                    messages, session_id=session_id, response=response
                 ):
                     if not chunk:
                         continue
@@ -512,6 +537,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        response: HermesStreamResult | None = None,
     ) -> AsyncIterator[str]:
         """Yield speech-safe assistant text chunks from Hermes streaming."""
         speech_filter = _UnsafeSpeechStreamFilter()
@@ -519,7 +545,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
 
         try:
             async for chunk in self.client.async_stream_message(
-                messages, session_id=session_id
+                messages, session_id=session_id, response=response
             ):
                 stream_started = True
                 if safe_chunk := speech_filter.feed(chunk):
@@ -532,6 +558,8 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 err,
             )
             result = await self.client.async_send_message(messages, session_id=session_id)
+            if response is not None:
+                response.session_id = result.session_id
             if safe_text := _sanitize_text_for_speech(result.text):
                 yield safe_text
             return
@@ -547,19 +575,13 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        response: HermesStreamResult | None = None,
     ) -> str:
         """Get a response from the API using voice-safe streaming."""
         chunks: list[str] = []
         try:
-            async for chunk in self._iter_voice_safe_response(messages, session_id):
+            async for chunk in self._iter_voice_safe_response(messages, session_id, response):
                 chunks.append(chunk)
-        except HermesStreamSetupError as err:
-            _LOGGER.debug(
-                "Hermes streaming setup failed; falling back to non-streaming: %s",
-                err,
-            )
-            result = await self.client.async_send_message(messages, session_id=session_id)
-            return result.text
         except HermesApiError:
             if chunks:
                 _LOGGER.warning(
