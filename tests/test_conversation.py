@@ -36,7 +36,6 @@ class FakeClient:
         send_text=None,
     ):
         self.calls = []
-        self.last_session_id = None
         self.next_session_id = "sess-1"
         self.next_text = "stored"
         self.stream_chunks = stream_chunks
@@ -51,14 +50,12 @@ class FakeClient:
         if response is not None:
             response.session_id = session_id or self.next_session_id
         if session_id is None:
-            self.last_session_id = self.next_session_id
             chunks = self.stream_chunks if self.stream_chunks is not None else [self.next_text]
             for chunk in chunks:
                 yield chunk
             if self.stream_error_after_chunks is not None:
                 raise self.stream_error_after_chunks
             return
-        self.last_session_id = session_id
         chunks = self.stream_chunks if self.stream_chunks is not None else [self.next_text]
         for chunk in chunks:
             yield chunk
@@ -68,12 +65,10 @@ class FakeClient:
     async def async_send_message(self, messages, session_id=None):
         self.calls.append({"method": "send", "messages": messages, "session_id": session_id})
         if session_id is None:
-            self.last_session_id = self.next_session_id
             return SimpleNamespace(
                 text=self.send_text or self.next_text,
                 session_id=self.next_session_id,
             )
-        self.last_session_id = session_id
         return SimpleNamespace(text=self.send_text or self.next_text, session_id=session_id)
 
 
@@ -603,6 +598,27 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response.speech["plain"]["speech"], "partial")
         self.assertEqual([call["method"] for call in client.calls], ["stream"])
         self.assertEqual(hass.data["last_chat_log"].content[-1].content, "partial")
+
+    async def test_legacy_partial_stream_setup_error_does_not_retry(self):
+        client = FakeClient(
+            stream_chunks=["partial"],
+            stream_error_after_chunks=HermesStreamSetupError("connection dropped"),
+            send_text="should not retry",
+        )
+        hass = FakeHass()
+        agent = HermesConversationAgent(
+            hass, FakeConfigEntry(options={CONF_PROMPT: ""}), client, session_map={}
+        )
+        with (
+            mock.patch.object(conversation_module, "async_get_chat_log", None),
+            mock.patch.object(conversation_module, "async_get_chat_session", None),
+            self.assertLogs(conversation_module._LOGGER, level="WARNING"),
+        ):
+            await agent.async_process(
+                FakeConversationInput("hi", conversation_id="legacy-partial")
+            )
+        self.assertEqual([call["method"] for call in client.calls], ["stream"])
+        self.assertNotIn("last_chat_log", hass.data)
 
     async def test_missing_chat_log_api_uses_final_legacy_response(self):
         original_get_chat_log = conversation_module.async_get_chat_log
