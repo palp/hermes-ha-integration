@@ -9,6 +9,7 @@ from custom_components.hermes_conversation.api import (
     HermesAuthError,
     HermesConnectionError,
     HermesStreamSetupError,
+    HermesStreamResult,
 )
 
 
@@ -551,7 +552,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.text, "hello")
         self.assertEqual(result.session_id, "sess-2")
-        self.assertEqual(client.last_session_id, "sess-2")
+        self.assertFalse(hasattr(client, "last_session_id"))
+        self.assertFalse(hasattr(client, "_last_session_id"))
         self.assertEqual(session.calls[0]["headers"]["X-Hermes-Session-Id"], "sess-1")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer secret")
         self.assertEqual(session.calls[0]["json"]["model"], "custom-model")
@@ -576,13 +578,16 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         parts = []
+        response = HermesStreamResult()
         async for part in client.async_stream_message(
-            [{"role": "user", "content": "hi"}], session_id="old-session"
+            [{"role": "user", "content": "hi"}], session_id="old-session", response=response
         ):
             parts.append(part)
 
         self.assertEqual("".join(parts), "Blue sky")
-        self.assertEqual(client.last_session_id, "sess-stream")
+        self.assertEqual(response.session_id, "sess-stream")
+        self.assertFalse(hasattr(client, "last_session_id"))
+        self.assertFalse(hasattr(client, "_last_session_id"))
         self.assertEqual(session.calls[0]["headers"]["X-Hermes-Session-Id"], "old-session")
         self.assertEqual(session.calls[0]["timeout"].total, 30)
         self.assertEqual(session.calls[0]["timeout"].sock_read, 12)
