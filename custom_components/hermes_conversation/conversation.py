@@ -278,6 +278,8 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self._attr_supported_features = ConversationEntityFeature.CONTROL
         # conversation_id -> list of {"role": ..., "content": ...}
         self._history: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
+        # Reference counts pin scopes while turns (including overlaps) are active.
+        self._active_scopes: dict[str, int] = {}
 
     @property
     def supported_languages(self) -> list[str] | str:
@@ -366,7 +368,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             or user_input.conversation_id
             or str(uuid.uuid4())
         )
-        follow_up_mode = self._continued_conversation_mode()
         session_reuse = self._session_reuse_enabled()
         authenticated = bool(entry_value(
             self.entry, CONF_API_KEY, "", prefer_options=False
@@ -377,14 +378,35 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             self._build_session_key(user_input, conv_id)
             if session_reuse else f"conversation:{conv_id}" if authenticated else None
         )
+        scope = session_key or f"conversation:{conv_id}"
+        self._active_scopes[scope] = self._active_scopes.get(scope, 0) + 1
+        try:
+            return await self._async_process_turn(
+                user_input, chat_log, conv_id, session_key, session_reuse, authenticated
+            )
+        finally:
+            self._active_scopes[scope] -= 1
+            if not self._active_scopes[scope]:
+                del self._active_scopes[scope]
+            self._prune_caches()
+
+    async def _async_process_turn(
+        self, user_input: ConversationInput, chat_log: ChatLog | None,
+        conv_id: str, session_key: str | None, session_reuse: bool,
+        authenticated: bool,
+    ) -> ConversationResult:
+        """Process a pinned scope; the caller releases it even on cancellation."""
+        follow_up_mode = self._continued_conversation_mode()
         session_id = self._get_active_session_id(session_key) if session_key else None
         if session_id is None and authenticated:
             # Never fall back to Hermes's deterministic headerless fingerprint.
             session_id = str(uuid.uuid4())
-        if session_key and not session_reuse:
+        if session_key:
             # Reserve before the first await: overlapping turns for this HA
             # conversation must not allocate different backend sessions.
             self._remember_session(session_key, session_id)
+        session_record = self.session_map.get(session_key) if session_key else None
+        self._prune_caches()
 
         # Resolve username from HA auth
         user_name = await self._get_user_name(user_input)
@@ -449,15 +471,17 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 continue_conversation=False,
             )
 
-        if session_key and (
-            session_reuse
-            or self.session_map.get(session_key, {}).get("session_id") == session_id
-        ):
-            # Reuse-off responses may rotate only the session they addressed;
+        current_session = not session_key or (
+            session_record is not None
+            and self.session_map.get(session_key) is session_record
+            and session_record.get("session_id") == session_id
+        )
+        if session_key and current_session:
+            # Responses may rotate only the session they addressed;
             # a late response must not undo expiry, reset, or another rotation.
             self._remember_session(session_key, response.session_id)
 
-        if not session_reuse:
+        if not session_reuse and current_session:
             history = self._history.setdefault(conv_id, [])
             history.append({"role": "user", "content": user_input.text})
             history.append({"role": "assistant", "content": spoken_text})
@@ -468,8 +492,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 if history and history[0]["role"] == "assistant":
                     history.pop(0)
 
-            while len(self._history) > _MAX_CACHED_CONVERSATIONS:
-                self._history.popitem(last=False)
+            self._prune_caches()
 
         intent_response = intent.IntentResponse(language=user_input.language)
         intent_response.async_set_speech(spoken_text)
@@ -822,7 +845,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         last_used_at = float(record.get("last_used_at", 0) or 0)
         timeout_seconds = self._session_timeout_seconds()
         if timeout_seconds and (time.time() - last_used_at) > timeout_seconds:
-            self.session_map.pop(session_key, None)
+            self._discard_scope(session_key)
             return None
 
         if isinstance(session_id, str) and session_id.strip():
@@ -834,10 +857,48 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             self.session_map.pop(session_key, None)
             return
 
-        self.session_map[session_key] = {
-            "session_id": session_id,
-            "last_used_at": time.time(),
-        }
+        # Dict insertion order is the session LRU, shared with history eviction.
+        record: dict[str, Any] | None = self.session_map.pop(session_key, None)
+        if record is None or record.get("session_id") != session_id:
+            # Record identity is a generation token, even if an ID cycles back.
+            record = {"session_id": session_id}
+        record["last_used_at"] = time.time()
+        self.session_map[session_key] = record
+
+    def _discard_scope(self, key: str) -> None:
+        """Evict backend routing and its local transcript together."""
+        self.session_map.pop(key, None)
+        if key.startswith("conversation:"):
+            self._history.pop(key.removeprefix("conversation:"), None)
+
+    def _prune_caches(self) -> None:
+        """Bound idle state, never evict in-flight scopes.
+
+        Busy scopes may temporarily exceed the limit; every completion, error,
+        or cancellation trims again. No permanent per-key locks are retained.
+        """
+        timeout = self._session_timeout_seconds()
+        now = time.time()
+        for key, record in list(self.session_map.items()):
+            if key not in self._active_scopes and timeout and (
+                now - float(record.get("last_used_at", 0) or 0) > timeout
+            ):
+                if entry_value(self.entry, CONF_API_KEY, "", prefer_options=False):
+                    self._discard_scope(key)
+                else:
+                    # Unauthenticated callers ignore backend state; retain text history.
+                    self.session_map.pop(key, None)
+        for key in list(self.session_map):
+            if len(self.session_map) <= _MAX_CACHED_CONVERSATIONS:
+                break
+            if key not in self._active_scopes:
+                self._discard_scope(key)
+        for conv_id in list(self._history):
+            if len(self._history) <= _MAX_CACHED_CONVERSATIONS:
+                break
+            key = f"conversation:{conv_id}"
+            if key not in self._active_scopes:
+                self._discard_scope(key)
 
     def _build_origin_context(self, user_input: ConversationInput) -> list[str]:
         lines: list[str] = []
