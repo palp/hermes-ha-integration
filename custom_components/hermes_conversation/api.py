@@ -49,6 +49,13 @@ class HermesApiResult:
     session_id: str | None
 
 
+@dataclass(slots=True)
+class HermesStreamResult:
+    """Response metadata owned by one streaming request, never by the client."""
+
+    session_id: str | None = None
+
+
 class HermesApiClient:
     """Client for the Hermes Agent OpenAI-compatible API."""
 
@@ -300,6 +307,8 @@ class HermesApiClient:
         self,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        *,
+        response: HermesStreamResult | None = None,
     ) -> AsyncGenerator[str, None]:
         """Send a streaming chat completion request. Yields content deltas."""
         await self._async_verify_native_profile_route()
@@ -328,7 +337,10 @@ class HermesApiClient:
                         f"API error {resp.status}: {body[:500]}"
                     )
 
-                self._last_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
+                resolved_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
+                self._last_session_id = resolved_session_id
+                if response is not None:
+                    response.session_id = resolved_session_id
 
                 # Parse SSE stream
                 buffer = ""
