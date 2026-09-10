@@ -56,9 +56,8 @@ class ContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids[0], ids[1])
         self.assertNotEqual(ids[1], ids[2])
         self.assertEqual(ids[2], ids[3])
-        # Setup creates a new map; the old client diagnostic ID is not routing state.
+        # Reload creates a new map rather than retaining the previous session.
         reloaded, reload_transport = make_agent([FakeResponse()], enable_session_reuse=False)
-        reloaded.client._last_session_id = ids[-1]
         await reloaded._async_handle_message(FakeConversationInput('Hello'), ChatLog('same'))
         fresh = reload_transport.calls[0]['headers']['X-Hermes-Session-Id']
         self.assertNotIn(fresh, ids)

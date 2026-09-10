@@ -99,16 +99,10 @@ class HermesApiClient:
         self._stream_timeout = max(self._request_timeout, int(stream_timeout))
         # ssl=False disables certificate verification (for self-signed certs)
         self._ssl: bool | None = None if not use_ssl else (None if verify_ssl else False)
-        self._last_session_id: str | None = None
 
     @property
     def base_url(self) -> str:
         return self._base_url
-
-    @property
-    def last_session_id(self) -> str | None:
-        """Most recent X-Hermes-Session-Id observed from the API."""
-        return self._last_session_id
 
     def _headers(self, session_id: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -291,7 +285,6 @@ class HermesApiClient:
                     )
                 data = await resp.json()
                 resolved_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
-                self._last_session_id = resolved_session_id
                 return HermesApiResult(
                     text=self._extract_content(data),
                     session_id=resolved_session_id,
@@ -338,7 +331,6 @@ class HermesApiClient:
                     )
 
                 resolved_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
-                self._last_session_id = resolved_session_id
                 if response is not None:
                     response.session_id = resolved_session_id
 

@@ -582,15 +582,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         try:
             async for chunk in self._iter_voice_safe_response(messages, session_id, response):
                 chunks.append(chunk)
-        except HermesStreamSetupError as err:
-            _LOGGER.debug(
-                "Hermes streaming setup failed; falling back to non-streaming: %s",
-                err,
-            )
-            result = await self.client.async_send_message(messages, session_id=session_id)
-            if response is not None:
-                response.session_id = result.session_id
-            return result.text
         except HermesApiError:
             if chunks:
                 _LOGGER.warning(
